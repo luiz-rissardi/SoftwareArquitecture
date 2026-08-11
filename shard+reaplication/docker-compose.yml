@@ -1,0 +1,823 @@
+version: "3.8"
+
+x-postgres-env: &postgres-env
+  POSTGRES_USER: postgres
+  POSTGRES_PASSWORD: postgrespassword
+  POSTGRES_HOST_AUTH_METHOD: trust
+  PGPASSWORD: postgrespassword
+
+networks:
+  citus-net:
+    driver: bridge
+
+services:
+
+  # ============================================================
+  # COORDINATOR
+  # ============================================================
+  coordinator:
+    image: citusdata/citus:12.1
+    container_name: coordinator
+    hostname: coordinator
+    restart: unless-stopped
+    environment:
+      <<: *postgres-env
+    ports:
+      - "5432:5432"
+    networks:
+      - citus-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    command:
+      - postgres
+      - -c
+      - max_prepared_transactions=200
+      - -c
+      - wal_level=replica
+      - -c
+      - max_wal_senders=10
+
+  # ============================================================
+  # HAPROXY COORDINATOR
+  # ============================================================
+  haproxy-coordinator:
+    image: haproxy:3.2
+    container_name: haproxy-coordinator
+    hostname: haproxy-coordinator
+    restart: unless-stopped
+    depends_on:
+      coordinator:
+        condition: service_healthy
+    ports:
+      - "5000:5000"
+    networks:
+      - citus-net
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        cat > /tmp/haproxy.cfg <<'EOF'
+        global
+            log stdout format raw local0
+
+        defaults
+            mode tcp
+            log global
+            timeout connect 5s
+            timeout client 30s
+            timeout server 30s
+
+        frontend postgres_frontend
+            bind *:5000
+            default_backend postgres_backend
+
+        backend postgres_backend
+            mode tcp
+            server coordinator coordinator:5432 check
+        EOF
+        exec haproxy -f /tmp/haproxy.cfg
+
+  # ============================================================
+  # SHARD 1 - PRIMARY
+  # ============================================================
+  worker-1:
+    image: citusdata/citus:12.1
+    container_name: worker-1
+    hostname: worker-1
+    restart: unless-stopped
+    environment:
+      <<: *postgres-env
+    networks:
+      - citus-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        docker-entrypoint.sh postgres \
+          -c max_prepared_transactions=200 \
+          -c wal_level=replica \
+          -c max_wal_senders=10 \
+          -c hot_standby=on &
+
+        PG_PID=$$!
+
+        until pg_isready -U postgres; do
+          sleep 1
+        done
+
+        grep -q "host replication postgres 0.0.0.0/0 trust" \
+          /var/lib/postgresql/data/pg_hba.conf || \
+          echo "host replication postgres 0.0.0.0/0 trust" \
+          >> /var/lib/postgresql/data/pg_hba.conf
+
+        grep -q "host all postgres 0.0.0.0/0 trust" \
+          /var/lib/postgresql/data/pg_hba.conf || \
+          echo "host all postgres 0.0.0.0/0 trust" \
+          >> /var/lib/postgresql/data/pg_hba.conf
+
+        psql -U postgres -c "SELECT pg_reload_conf();"
+
+        wait $$PG_PID
+
+  # ============================================================
+  # SHARD 1 - REPLICA
+  # ============================================================
+  worker-1-replica:
+    image: citusdata/citus:12.1
+    container_name: worker-1-replica
+    hostname: worker-1-replica
+    restart: unless-stopped
+    environment:
+      <<: *postgres-env
+    depends_on:
+      worker-1:
+        condition: service_healthy
+    networks:
+      - citus-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        until pg_isready -h worker-1 -p 5432 -U postgres; do
+          sleep 1
+        done
+
+        if [ ! -f /var/lib/postgresql/data/PG_VERSION ]; then
+          rm -rf /var/lib/postgresql/data/*
+
+          PGPASSWORD=postgrespassword pg_basebackup \
+            -h worker-1 \
+            -D /var/lib/postgresql/data \
+            -U postgres \
+            -Fp \
+            -Xs \
+            -P \
+            -R
+
+          echo "hot_standby = on" >> \
+            /var/lib/postgresql/data/postgresql.conf
+        fi
+
+        exec docker-entrypoint.sh postgres
+
+  # ============================================================
+  # HAPROXY SHARD 1
+  # ============================================================
+  haproxy-shard-1:
+    image: haproxy:3.2
+    container_name: haproxy-shard-1
+    hostname: haproxy-shard-1
+    restart: unless-stopped
+    depends_on:
+      worker-1:
+        condition: service_healthy
+      worker-1-replica:
+        condition: service_healthy
+    ports:
+      - "5001:5001"
+      - "5101:5101"
+    networks:
+      - citus-net
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        cat > /tmp/haproxy.cfg <<'EOF'
+        global
+            log stdout format raw local0
+
+        defaults
+            mode tcp
+            log global
+            timeout connect 5s
+            timeout client 30s
+            timeout server 30s
+
+        frontend postgres_write
+            bind *:5001
+            default_backend postgres_write_backend
+
+        backend postgres_write_backend
+            mode tcp
+            server primary worker-1:5432 check
+            server replica worker-1-replica:5432 check backup
+
+        frontend postgres_read
+            bind *:5101
+            default_backend postgres_read_backend
+
+        backend postgres_read_backend
+            mode tcp
+            balance roundrobin
+            server primary worker-1:5432 check
+            server replica worker-1-replica:5432 check
+        EOF
+        exec haproxy -f /tmp/haproxy.cfg
+
+  # ============================================================
+  # SHARD 2 - PRIMARY
+  # ============================================================
+  worker-2:
+    image: citusdata/citus:12.1
+    container_name: worker-2
+    hostname: worker-2
+    restart: unless-stopped
+    environment:
+      <<: *postgres-env
+    networks:
+      - citus-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        docker-entrypoint.sh postgres \
+          -c max_prepared_transactions=200 \
+          -c wal_level=replica \
+          -c max_wal_senders=10 \
+          -c hot_standby=on &
+
+        PG_PID=$$!
+
+        until pg_isready -U postgres; do
+          sleep 1
+        done
+
+        grep -q "host replication postgres 0.0.0.0/0 trust" \
+          /var/lib/postgresql/data/pg_hba.conf || \
+          echo "host replication postgres 0.0.0.0/0 trust" \
+          >> /var/lib/postgresql/data/pg_hba.conf
+
+        grep -q "host all postgres 0.0.0.0/0 trust" \
+          /var/lib/postgresql/data/pg_hba.conf || \
+          echo "host all postgres 0.0.0.0/0 trust" \
+          >> /var/lib/postgresql/data/pg_hba.conf
+
+        psql -U postgres -c "SELECT pg_reload_conf();"
+
+        wait $$PG_PID
+
+  # ============================================================
+  # SHARD 2 - REPLICA
+  # ============================================================
+  worker-2-replica:
+    image: citusdata/citus:12.1
+    container_name: worker-2-replica
+    hostname: worker-2-replica
+    restart: unless-stopped
+    environment:
+      <<: *postgres-env
+    depends_on:
+      worker-2:
+        condition: service_healthy
+    networks:
+      - citus-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        until pg_isready -h worker-2 -p 5432 -U postgres; do
+          sleep 1
+        done
+
+        if [ ! -f /var/lib/postgresql/data/PG_VERSION ]; then
+          rm -rf /var/lib/postgresql/data/*
+
+          PGPASSWORD=postgrespassword pg_basebackup \
+            -h worker-2 \
+            -D /var/lib/postgresql/data \
+            -U postgres \
+            -Fp \
+            -Xs \
+            -P \
+            -R
+
+          echo "hot_standby = on" >> \
+            /var/lib/postgresql/data/postgresql.conf
+        fi
+
+        exec docker-entrypoint.sh postgres
+
+  # ============================================================
+  # HAPROXY SHARD 2
+  # ============================================================
+  haproxy-shard-2:
+    image: haproxy:3.2
+    container_name: haproxy-shard-2
+    hostname: haproxy-shard-2
+    restart: unless-stopped
+    depends_on:
+      worker-2:
+        condition: service_healthy
+      worker-2-replica:
+        condition: service_healthy
+    ports:
+      - "5002:5002"
+      - "5102:5102"
+    networks:
+      - citus-net
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        cat > /tmp/haproxy.cfg <<'EOF'
+        global
+            log stdout format raw local0
+
+        defaults
+            mode tcp
+            log global
+            timeout connect 5s
+            timeout client 30s
+            timeout server 30s
+
+        frontend postgres_write
+            bind *:5002
+            default_backend postgres_write_backend
+
+        backend postgres_write_backend
+            mode tcp
+            server primary worker-2:5432 check
+            server replica worker-2-replica:5432 check backup
+
+        frontend postgres_read
+            bind *:5102
+            default_backend postgres_read_backend
+
+        backend postgres_read_backend
+            mode tcp
+            balance roundrobin
+            server primary worker-2:5432 check
+            server replica worker-2-replica:5432 check
+        EOF
+        exec haproxy -f /tmp/haproxy.cfg
+
+  # ============================================================
+  # SHARD 3 - PRIMARY
+  # ============================================================
+  worker-3:
+    image: citusdata/citus:12.1
+    container_name: worker-3
+    hostname: worker-3
+    restart: unless-stopped
+    environment:
+      <<: *postgres-env
+    networks:
+      - citus-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        docker-entrypoint.sh postgres \
+          -c max_prepared_transactions=200 \
+          -c wal_level=replica \
+          -c max_wal_senders=10 \
+          -c hot_standby=on &
+
+        PG_PID=$$!
+
+        until pg_isready -U postgres; do
+          sleep 1
+        done
+
+        grep -q "host replication postgres 0.0.0.0/0 trust" \
+          /var/lib/postgresql/data/pg_hba.conf || \
+          echo "host replication postgres 0.0.0.0/0 trust" \
+          >> /var/lib/postgresql/data/pg_hba.conf
+
+        grep -q "host all postgres 0.0.0.0/0 trust" \
+          /var/lib/postgresql/data/pg_hba.conf || \
+          echo "host all postgres 0.0.0.0/0 trust" \
+          >> /var/lib/postgresql/data/pg_hba.conf
+
+        psql -U postgres -c "SELECT pg_reload_conf();"
+
+        wait $$PG_PID
+
+  # ============================================================
+  # SHARD 3 - REPLICA
+  # ============================================================
+  worker-3-replica:
+    image: citusdata/citus:12.1
+    container_name: worker-3-replica
+    hostname: worker-3-replica
+    restart: unless-stopped
+    environment:
+      <<: *postgres-env
+    depends_on:
+      worker-3:
+        condition: service_healthy
+    networks:
+      - citus-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        until pg_isready -h worker-3 -p 5432 -U postgres; do
+          sleep 1
+        done
+
+        if [ ! -f /var/lib/postgresql/data/PG_VERSION ]; then
+          rm -rf /var/lib/postgresql/data/*
+
+          PGPASSWORD=postgrespassword pg_basebackup \
+            -h worker-3 \
+            -D /var/lib/postgresql/data \
+            -U postgres \
+            -Fp \
+            -Xs \
+            -P \
+            -R
+
+          echo "hot_standby = on" >> \
+            /var/lib/postgresql/data/postgresql.conf
+        fi
+
+        exec docker-entrypoint.sh postgres
+
+  # ============================================================
+  # HAPROXY SHARD 3
+  # ============================================================
+  haproxy-shard-3:
+    image: haproxy:3.2
+    container_name: haproxy-shard-3
+    hostname: haproxy-shard-3
+    restart: unless-stopped
+    depends_on:
+      worker-3:
+        condition: service_healthy
+      worker-3-replica:
+        condition: service_healthy
+    ports:
+      - "5003:5003"
+      - "5103:5103"
+    networks:
+      - citus-net
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        cat > /tmp/haproxy.cfg <<'EOF'
+        global
+            log stdout format raw local0
+
+        defaults
+            mode tcp
+            log global
+            timeout connect 5s
+            timeout client 30s
+            timeout server 30s
+
+        frontend postgres_write
+            bind *:5003
+            default_backend postgres_write_backend
+
+        backend postgres_write_backend
+            mode tcp
+            server primary worker-3:5432 check
+            server replica worker-3-replica:5432 check backup
+
+        frontend postgres_read
+            bind *:5103
+            default_backend postgres_read_backend
+
+        backend postgres_read_backend
+            mode tcp
+            balance roundrobin
+            server primary worker-3:5432 check
+            server replica worker-3-replica:5432 check
+        EOF
+        exec haproxy -f /tmp/haproxy.cfg
+
+  # ============================================================
+  # CITUS INIT — registra os workers no coordinator
+  # ============================================================
+  # Roda uma vez, depois que coordinator + workers estão saudáveis.
+  # É idempotente: pode rodar de novo a qualquer momento sem duplicar
+  # nem quebrar nada. Corrige/remove qualquer node registrado como
+  # "localhost" (que aponta pro próprio coordinator em vez dos workers
+  # reais) e garante que worker-1/2/3 estejam registrados corretamente.
+  citus-init:
+    image: citusdata/citus:12.1
+    container_name: citus-init
+    hostname: citus-init
+    restart: "no"
+    environment:
+      <<: *postgres-env
+    networks:
+      - citus-net
+    depends_on:
+      coordinator:
+        condition: service_healthy
+      worker-1:
+        condition: service_healthy
+      worker-2:
+        condition: service_healthy
+      worker-3:
+        condition: service_healthy
+      haproxy-shard-1:
+        condition: service_started
+      haproxy-shard-2:
+        condition: service_started
+      haproxy-shard-3:
+        condition: service_started
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        set -e
+
+        until pg_isready -h coordinator -U postgres; do
+          sleep 1
+        done
+
+        echo "Registrando workers no coordinator..."
+
+        # os nodes do Citus devem apontar pro HAProxy de cada shard, não
+        # pro worker direto — assim, quando o failover-manager promove a
+        # réplica, o HAProxy já redireciona sozinho (o backup server dele
+        # assume automaticamente quando o primary para de responder ao
+        # health check), sem que o coordinator precise saber que trocou.
+        for hp_port in 5001 5002 5003; do
+          hp_host="haproxy-shard-$$((hp_port - 5000))"
+          until pg_isready -h "$$hp_host" -p "$$hp_port" -U postgres; do
+            sleep 1
+          done
+        done
+
+        psql -h coordinator -U postgres -d postgres -v ON_ERROR_STOP=1 <<-'SQL'
+          -- 1) o coordinator precisa saber seu próprio hostname real,
+          --    senão os workers não conseguem se conectar de volta pra
+          --    transferir shards e citus_add_node falha
+          SELECT citus_set_coordinator_host('coordinator', 5432);
+
+          -- 2) se algum node ainda estiver registrado com o hostname cru
+          --    do worker (ex: de um setup anterior), reaponta pro HAProxy
+          --    do shard correspondente — citus_update_node não move dados,
+          --    só troca o endereço de conexão
+          DO $$$$
+          DECLARE
+            r RECORD;
+            target_host TEXT;
+            target_port INT;
+          BEGIN
+            FOR r IN
+              SELECT nodeid, nodename FROM pg_dist_node
+              WHERE nodename IN ('worker-1', 'worker-2', 'worker-3')
+            LOOP
+              target_host := replace(r.nodename, 'worker-', 'haproxy-shard-');
+              target_port := 5000 + substring(r.nodename FROM 'worker-(\d+)')::int;
+              PERFORM citus_update_node(r.nodeid, target_host, target_port);
+            END LOOP;
+          END $$$$;
+
+          -- 3) registra cada shard via seu HAProxy, só se ainda não estiver
+          DO $$$$
+          BEGIN
+            IF NOT EXISTS (SELECT 1 FROM pg_dist_node WHERE nodename = 'haproxy-shard-1') THEN
+              PERFORM citus_add_node('haproxy-shard-1', 5001);
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM pg_dist_node WHERE nodename = 'haproxy-shard-2') THEN
+              PERFORM citus_add_node('haproxy-shard-2', 5002);
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM pg_dist_node WHERE nodename = 'haproxy-shard-3') THEN
+              PERFORM citus_add_node('haproxy-shard-3', 5003);
+            END IF;
+          END $$$$;
+
+          -- 4) se sobrou algum node "localhost"/"127.0.0.1" com dados
+          --    presos nele (de um setup anterior incorreto), rebalanceia
+
+          --    antes de tentar remover — não dá pra remover node com
+          --    shard placement ativo
+          DO $$$$
+          DECLARE
+            has_bad_node BOOLEAN;
+          BEGIN
+            SELECT EXISTS (
+              SELECT 1 FROM pg_dist_node
+              WHERE nodename IN ('localhost', '127.0.0.1') AND groupid <> 0
+            ) INTO has_bad_node;
+
+            IF has_bad_node THEN
+              BEGIN
+                PERFORM rebalance_table_shards();
+              EXCEPTION WHEN OTHERS THEN
+                RAISE NOTICE 'Rebalance padrão falhou (%), tentando modo block_writes...', SQLERRM;
+                PERFORM rebalance_table_shards(shard_transfer_mode => 'block_writes');
+              END;
+            END IF;
+          END $$$$;
+
+          -- 4) agora sim remove o node ruim, se ainda existir e já
+          --    estiver sem shards (ignora erro se ainda tiver algo preso,
+          --    pra não travar o resto do init — precisa investigar manual)
+          DO $$$$
+          DECLARE
+            r RECORD;
+          BEGIN
+            FOR r IN
+              SELECT nodename, nodeport
+              FROM pg_dist_node
+              WHERE nodename IN ('localhost', '127.0.0.1') AND groupid <> 0
+            LOOP
+              BEGIN
+                PERFORM citus_remove_node(r.nodename, r.nodeport);
+              EXCEPTION WHEN OTHERS THEN
+                RAISE NOTICE 'Não foi possível remover % — provavelmente ainda tem shards presos, verifique manualmente', r.nodename;
+              END;
+            END LOOP;
+          END $$$$;
+        SQL
+
+        echo "Nodes registrados. Estado atual:"
+
+        psql -h coordinator -U postgres -d postgres -c \
+          "SELECT nodeid, nodename, nodeport, groupid, isactive, shouldhaveshards FROM pg_dist_node ORDER BY groupid;"
+
+  # ============================================================
+  # FAILOVER MANAGER
+  # ============================================================
+  failover-manager:
+    image: alpine:3.19
+    container_name: failover-manager
+    hostname: failover-manager
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - citus-net
+    depends_on:
+      worker-1:
+        condition: service_healthy
+      worker-1-replica:
+        condition: service_healthy
+      worker-2:
+        condition: service_healthy
+      worker-2-replica:
+        condition: service_healthy
+      worker-3:
+        condition: service_healthy
+      worker-3-replica:
+        condition: service_healthy
+    command:
+      - /bin/sh
+      - -c
+      - |
+        apk add --no-cache postgresql15-client docker-cli bash
+
+        echo "=========================================="
+        echo "   POSTGRESQL FAILOVER MANAGER"
+        echo "=========================================="
+        echo ""
+        echo "SHARD 1: worker-1 <-> worker-1-replica"
+        echo "SHARD 2: worker-2 <-> worker-2-replica"
+        echo "SHARD 3: worker-3 <-> worker-3-replica"
+        echo ""
+
+        sleep 30
+
+        check_node() {
+          NODE=$$1
+          pg_isready -h "$$NODE" -p 5432 -U postgres >/dev/null 2>&1
+        }
+
+        is_replica() {
+          NODE=$$1
+          RESULT=$$(PGPASSWORD=postgrespassword \
+            psql -h "$$NODE" -p 5432 -U postgres -d postgres \
+            -tAc "SELECT pg_is_in_recovery();" 2>/dev/null | tr -d '[:space:]')
+          [ "$$RESULT" = "t" ]
+        }
+
+        promote_replica() {
+          REPLICA=$$1
+          echo "Promovendo $$REPLICA..."
+
+          RESULT=$$(PGPASSWORD=postgrespassword \
+            psql -h "$$REPLICA" -p 5432 -U postgres -d postgres \
+            -tAc "SELECT pg_promote();" 2>/dev/null | tr -d '[:space:]')
+
+          if [ "$$RESULT" = "t" ]; then
+            sleep 5
+            if ! is_replica "$$REPLICA"; then
+              echo "OK: $$REPLICA agora é PRIMARY"
+              return 0
+            fi
+          fi
+
+          echo "ERRO: promoção de $$REPLICA falhou"
+          return 1
+        }
+
+        update_haproxy() {
+          PROXY=$$1
+          PRIMARY=$$2
+          REPLICA=$$3
+
+          echo "Atualizando $$PROXY..."
+
+          docker exec "$$PROXY" sh -c "
+            sed -i \
+              -e 's/server primary .*/server primary $$PRIMARY:5432 check/' \
+              -e 's/server replica .*/server replica $$REPLICA:5432 check backup/' \
+              /tmp/haproxy.cfg
+
+            haproxy -c -f /tmp/haproxy.cfg
+
+            kill -HUP 1
+          " 2>/dev/null
+
+          echo "HAProxy atualizado"
+        }
+
+        handle_pair() {
+          NAME=$$1
+          PRIMARY=$$2
+          REPLICA=$$3
+          PROXY=$$4
+
+          echo ""
+          echo "=========================================="
+          echo "$$NAME"
+          echo "PRIMARY : $$PRIMARY"
+          echo "REPLICA : $$REPLICA"
+          echo "=========================================="
+
+          if check_node "$$PRIMARY"; then
+            echo "PRIMARY $$PRIMARY: ONLINE"
+            return
+          fi
+
+          echo "ALERTA: $$PRIMARY OFFLINE"
+
+          if ! check_node "$$REPLICA"; then
+            echo "ERRO: $$REPLICA também está OFFLINE"
+            return
+          fi
+
+          if ! is_replica "$$REPLICA"; then
+            echo "$$REPLICA já está promovido"
+            return
+          fi
+
+          echo "Iniciando FAILOVER..."
+
+          if promote_replica "$$REPLICA"; then
+            update_haproxy "$$PROXY" "$$REPLICA" "$$PRIMARY"
+
+            echo ""
+            echo "=========================================="
+            echo "FAILOVER CONCLUÍDO"
+            echo "NOVO PRIMARY: $$REPLICA"
+            echo "=========================================="
+          fi
+        }
+
+        echo "Monitor de Failover iniciado."
+
+        while true; do
+          handle_pair "SHARD-1" "worker-1" "worker-1-replica" "haproxy-shard-1"
+          handle_pair "SHARD-2" "worker-2" "worker-2-replica" "haproxy-shard-2"
+          handle_pair "SHARD-3" "worker-3" "worker-3-replica" "haproxy-shard-3"
+          sleep 5
+        done
