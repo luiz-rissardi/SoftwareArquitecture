@@ -9,6 +9,11 @@
   "keywords": [],
   "type": "module",
   "dependencies": {
-    "mysql2": "^3.23.2"
+    "express": "^5.2.1",
+    "ioredis": "^6.0.0",
+    "kafkajs": "^2.2.4",
+    "mysql2": "^3.23.3",
+    "pg": "^8.23.0",
+    "uuid": "^14.0.1"
   }
 }

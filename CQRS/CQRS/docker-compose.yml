@@ -1,0 +1,63 @@
+version: '3.8'
+
+services:
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: root_pw
+    command:
+      # Binlog em formato ROW é obrigatório para o Debezium capturar
+      # o "before"/"after" de cada linha alterada.
+      - --server-id=1
+      - --log-bin=mysql-bin
+      - --binlog-format=ROW
+      - --binlog-row-image=FULL
+    ports:
+      # 3307 externo (não 3306) para não colidir com um MySQL que já
+      # esteja rodando na sua máquina. Internamente, dentro da rede do
+      # Docker, o container continua ouvindo em 3306 mesmo.
+      - "3307:3306"
+    volumes:
+      # Caminho ajustado para a sua pasta: write/schema.sql (não mais
+      # write-service/schema.sql). ${PWD} garante que resolve relativo
+      # à pasta onde você roda `docker compose up`.
+      - ${PWD}/write/schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    depends_on: [zookeeper]
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://localhost:29092
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:9092,EXTERNAL://0.0.0.0:29092
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    ports:
+      - "29092:29092"
+
+  connect:
+    image: debezium/connect:2.6
+    depends_on: [kafka, mysql]
+    environment:
+      BOOTSTRAP_SERVERS: kafka:9092
+      GROUP_ID: 1
+      CONFIG_STORAGE_TOPIC: connect_configs
+      OFFSET_STORAGE_TOPIC: connect_offsets
+      STATUS_STORAGE_TOPIC: connect_statuses
+    ports:
+      - "8083:8083" # REST API para registrar o conector
+
+  redis:
+    image: redis:7-alpine
+    # Persistência ligada (AOF), já que o read model precisa
+    # sobreviver a um restart sem depender de replay total do Kafka.
+    command: redis-server --appendonly yes
+    ports:
+      - "6379:6379"
